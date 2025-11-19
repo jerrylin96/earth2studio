@@ -1,176 +1,222 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-import cbottle.inference
+"""
+CBottle Video Conditional Animation
+====================================
+
+Create conditional weather forecast animations using CBottleVideo with ERA5 data.
+"""
+
 import torch
-from cbottle.visualizations import visualize
-import cbottle.netcdf_writer
-from cbottle.datasets.dataset_3d import get_dataset
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.colors
-from dataclasses import dataclass
-from typing import Annotated
 import numpy as np
 import pandas as pd
 import os
-import sys
 import gc
-import xarray as xr
-
-from datetime import datetime, timedelta
-import earth2grid
-from earth2grid import healpix
+from datetime import datetime
 import cartopy.crs as ccrs
 
-from earth2studio.data import WB2ERA5, CBottle3D
+from earth2studio.data import WB2ERA5
 from earth2studio.lexicon import WB2Lexicon, CBottleLexicon
 from earth2studio.models.dx import CBottleInfill
-from earth2studio.data.utils import fetch_data
-from earth2studio.lexicon.wb2 import WB2Lexicon
-from earth2studio.lexicon.cbottle import CBottleLexicon
 from earth2studio.models.px import CBottleVideo
-from earth2studio.io import ZarrBackend
+from earth2studio.data.utils import fetch_data
 
-from cbottle.datasets.merged_dataset import TimeMergedMapStyle
-from cbottle.dataclass_parser import parse_args, healpix_order
-
-import tempfile
-from tqdm import tqdm
-
-# Get the device
+# Configuration
+os.makedirs("outputs", exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# Load the CBottleVideo model
-package = CBottleVideo.load_default_package()
-cbottle_video = CBottleVideo.load_model(package, seed=42)
-cbottle_video = cbottle_video.to(device)
+# Parameters - CONFIGURE THESE
+VIDEO_VARIABLE = "t850"
+INITIALIZATION_TIME = datetime(2022, 6, 1)
+N_FRAMES = 12  # 0-66 hours in 6-hour steps
+SEED = 42
 
-projection = ccrs.Orthographic(central_longitude=0.0, central_latitude=45.0)
-
-video_variable = "t850"
-video_var_idx = np.where(uncond_coords_list[0]["variable"] == video_variable)[0][0]
-
-wb2_vars = list(WB2Lexicon.VOCAB.keys())
+# ============================================================================
+# Step 1: Determine Available ERA5 Variables
+# ============================================================================
+print("\nDetermining available ERA5 variables...")
+wb2_vars = set(WB2Lexicon.VOCAB.keys())
 cbottle_vars = list(CBottleLexicon.VOCAB.keys())
+available_in_era5 = sorted([v for v in cbottle_vars if v in wb2_vars])
 
-available_in_era5 = []
-missing_from_era5 = []
+print(f"Using {len(available_in_era5)} ERA5 variables for conditioning")
 
-for cbottle_var in cbottle_vars:
-    if cbottle_var in wb2_vars:
-        available_in_era5.append(cbottle_var)
-    else:
-        missing_from_era5.append(cbottle_var)
-
-available_in_era5 = sorted(available_in_era5)
-missing_from_era5 = sorted(missing_from_era5)
-
-# Load ERA5 data source
+# ============================================================================
+# Step 2: Fetch and Infill ERA5 Data
+# ============================================================================
+print("\nFetching ERA5 data...")
 era5_ds = WB2ERA5()
+times = np.array([INITIALIZATION_TIME], dtype="datetime64[ns]")
 
-# Load CBottleInfill model to generate all required variables
-input_variables = available_in_era5
+# Fetch ERA5 data ONCE
+era5_x, era5_coords = fetch_data(era5_ds, times, available_in_era5, device=device)
+print(f"ERA5 data shape: {era5_x.shape}")
 
-# Fetch ERA5 data
-print("Fetching ERA5 data and running infill...")
-era5_x, era5_coords = fetch_data(era5_ds, times, input_variables, device=device)
-
+# Load and run CBottleInfill
+print("\nRunning CBottleInfill...")
 package_infill = CBottleInfill.load_default_package()
 cbottle_infill = CBottleInfill.load_model(
-    package_infill, input_variables=input_variables, sampler_steps=18
+    package_infill,
+    input_variables=available_in_era5,
+    sampler_steps=18
 )
 cbottle_infill = cbottle_infill.to(device)
-cbottle_infill.set_seed(42)
+cbottle_infill.set_seed(SEED)
 
-# Fetch ERA5 data
-print("Fetching ERA5 data and running infill...")
-era5_x, era5_coords = fetch_data(era5_ds, times, input_variables, device=device)
-
-# Infill to get all 45 CBottleVideo variables
+# Run infilling
 infilled_x, infilled_coords = cbottle_infill(era5_x, era5_coords)
+print(f"Infilled data shape: {infilled_x.shape}")
 
-# Reshape for CBottleVideo input: [batch, time, lead_time, variable, lat, lon]
-x_cond = infilled_x.unsqueeze(0)  # Add batch dimension
-x_cond_masked = x_cond.clone()
-del x_cond
+# CRITICAL: Free CBottleInfill and ERA5 data from GPU
+del cbottle_infill, era5_x, era5_coords
+torch.cuda.empty_cache()
 gc.collect()
-x_cond_masked[:,1:-1,:,:,:,:] = float('nan')
+print("✓ Freed CBottleInfill from GPU memory")
 
-print(f"Conditioned input shape: {x_cond_masked.shape}")
+# ============================================================================
+# Step 3: Prepare Conditional Input
+# ============================================================================
+print("\nPreparing conditional input...")
 
-# Update coordinates for CBottleVideo
-coords_cond = cbottle_video.input_coords()
-coords_cond["time"] = times
-coords_cond["batch"] = np.array([0])
-coords_cond["variable"] = infilled_coords["variable"]
+# Add batch dimension if needed
+if len(infilled_x.shape) == 5:  # [time, lead_time, variable, lat, lon]
+    x_cond = infilled_x.unsqueeze(0)  # [batch, time, lead_time, variable, lat, lon]
+else:
+    x_cond = infilled_x
 
-# Run conditional inference
-print("Running conditional generation...")
-iterator_cond = cbottle_video.create_iterator(x_cond_masked, coords_cond)
-cond_outputs = []
-cond_coords_list = []
-for step, (output, output_coords) in enumerate(iterator_cond):
+print(f"Conditional input shape: {x_cond.shape}")
+
+# Optional: Apply masking (condition only on first/last timesteps)
+# x_cond_masked = x_cond.clone()
+# x_cond_masked[:, 1:-1, :, :, :, :] = float('nan')  # Mask middle timesteps
+# x_cond = x_cond_masked
+
+# Setup coordinates
+coords_cond = {
+    "time": infilled_coords["time"] if "time" in infilled_coords else times,
+    "batch": np.array([0]),
+    "variable": infilled_coords["variable"],
+    "lead_time": infilled_coords.get("lead_time", np.array([np.timedelta64(0, "h")])),
+    "lat": infilled_coords["lat"],
+    "lon": infilled_coords["lon"],
+}
+
+# ============================================================================
+# Step 4: Run CBottleVideo Inference
+# ============================================================================
+print("\nLoading CBottleVideo...")
+package_video = CBottleVideo.load_default_package()
+cbottle_video = CBottleVideo.load_model(package_video, seed=SEED)
+cbottle_video = cbottle_video.to(device)
+
+print("Running conditional video generation...")
+iterator = cbottle_video.create_iterator(x_cond, coords_cond)
+
+# CRITICAL: Move x_cond off GPU after starting iterator
+# (Keep a CPU copy if you need it later)
+x_cond_cpu = x_cond.cpu()
+del x_cond, infilled_x, infilled_coords
+torch.cuda.empty_cache()
+print("✓ Moved input data to CPU")
+
+# Collect outputs (moved to CPU immediately)
+outputs = []
+coords_list = []
+for step, (output, output_coords) in enumerate(iterator):
     lead_time = output_coords["lead_time"][0]
     hours = int(lead_time / np.timedelta64(1, "h"))
-    print(f"Step {step}: lead_time = +{hours}h")
-    cond_outputs.append(output.cpu())
-    cond_coords_list.append(output_coords)
-    if step >= 11:  # Get first 12 frames (0-66 hours)
+    print(f"  Step {step}: +{hours}h")
+
+    # CRITICAL: Move to CPU immediately
+    outputs.append(output.cpu())
+    coords_list.append(output_coords)
+
+    # Free GPU memory after each step
+    del output
+    if step % 3 == 0:  # Periodic cleanup
+        torch.cuda.empty_cache()
+
+    if step >= N_FRAMES - 1:
         break
 
-fig_cond = plt.figure(figsize=(12, 8))
-ax_cond = fig_cond.add_subplot(111, projection=projection)
+# CRITICAL: Free CBottleVideo from GPU
+del cbottle_video
+torch.cuda.empty_cache()
+gc.collect()
+print("✓ Freed CBottleVideo from GPU memory")
 
-# Set up the first frame
-data_cond = cond_outputs[0][0, 0, 0, video_var_idx].numpy()
+# ============================================================================
+# Step 5: Create Animation
+# ============================================================================
+print(f"\nCreating animation for variable: {VIDEO_VARIABLE}")
 
-img_cond = ax_cond.pcolormesh(
-    cond_coords_list[0]["lon"],
-    cond_coords_list[0]["lat"],
-    data_cond,
+# Find variable index
+var_names = coords_list[0]["variable"]
+try:
+    var_idx = np.where(var_names == VIDEO_VARIABLE)[0][0]
+except IndexError:
+    print(f"Error: Variable '{VIDEO_VARIABLE}' not found!")
+    print(f"Available variables: {list(var_names)}")
+    exit(1)
+
+# Setup plot
+plt.style.use("dark_background")
+projection = ccrs.Orthographic(central_longitude=0.0, central_latitude=45.0)
+fig = plt.figure(figsize=(12, 8))
+ax = fig.add_subplot(111, projection=projection)
+
+# Get data range for colormap
+data_min = min(outputs[i][0, 0, 0, var_idx].min() for i in range(len(outputs)))
+data_max = max(outputs[i][0, 0, 0, var_idx].max() for i in range(len(outputs)))
+norm = matplotlib.colors.Normalize(vmin=data_min, vmax=data_max)
+
+# First frame
+data_first = outputs[0][0, 0, 0, var_idx].numpy()
+img = ax.pcolormesh(
+    coords_list[0]["lon"],
+    coords_list[0]["lat"],
+    data_first,
     transform=ccrs.PlateCarree(),
     cmap="viridis",
     norm=norm,
 )
-ax_cond.coastlines()
-ax_cond.gridlines()
-plt.colorbar(
-    img_cond, ax=ax_cond, orientation="horizontal", shrink=0.5, pad=0.05, label="T850 (K)"
-)
+ax.coastlines()
+ax.gridlines()
+plt.colorbar(img, ax=ax, orientation="horizontal", shrink=0.5, pad=0.05,
+             label=f"{VIDEO_VARIABLE}")
 
-lead_time = cond_coords_list[0]["lead_time"][0]
+# Initial title
+lead_time = coords_list[0]["lead_time"][0]
 hours = int(lead_time / np.timedelta64(1, "h"))
-time_str = pd.Timestamp(
-    cond_coords_list[0]["time"][0] + cond_coords_list[0]["lead_time"][0]
-).strftime("%Y-%m-%d %H:%M")
-title_cond = ax_cond.set_title(
-    f"Conditional Generation (ERA5): {video_variable} +{hours:03d}h ({time_str})"
-)
+time_str = pd.Timestamp(coords_list[0]["time"][0] + lead_time).strftime("%Y-%m-%d %H:%M")
+title = ax.set_title(f"Conditional: {VIDEO_VARIABLE} +{hours:03d}h ({time_str})")
+fig.tight_layout()
 
-fig_cond.tight_layout()
+def update(frame):
+    """Update animation frame"""
+    data = outputs[frame][0, 0, 0, var_idx].numpy()
+    img.set_array(data.ravel())
 
-
-def update_cond(frame):
-    """Update conditional animation frame"""
-    data = cond_outputs[frame][0, 0, 0, video_var_idx].numpy()
-    img_cond.set_array(data.ravel())
-
-    lead_time = cond_coords_list[frame]["lead_time"][0]
+    lead_time = coords_list[frame]["lead_time"][0]
     hours = int(lead_time / np.timedelta64(1, "h"))
-    time_str = pd.Timestamp(
-        cond_coords_list[frame]["time"][0] + cond_coords_list[frame]["lead_time"][0]
-    ).strftime("%Y-%m-%d %H:%M")
-    title_cond.set_text(
-        f"Conditional Generation (ERA5): {video_variable} +{hours:03d}h ({time_str})"
-    )
-    return [img_cond, title_cond]
+    time_str = pd.Timestamp(coords_list[frame]["time"][0] + lead_time).strftime("%Y-%m-%d %H:%M")
+    title.set_text(f"Conditional: {VIDEO_VARIABLE} +{hours:03d}h ({time_str})")
+    return [img, title]
 
+# Create and save animation
+print("Rendering animation...")
+anim = animation.FuncAnimation(fig, update, frames=len(outputs), interval=500, blit=True)
 
-# Create animation
-print("Creating conditional video...")
-anim_cond = animation.FuncAnimation(
-    fig_cond, update_cond, frames=len(cond_outputs), interval=500, blit=True
-)
-
-# Save video
-anim_cond.save("outputs/19_cbottle_video_conditional.mp4", writer=writer, dpi=100)
+output_file = f"outputs/21_cbottle_conditional_{VIDEO_VARIABLE}.mp4"
+writer = animation.FFMpegWriter(fps=2)
+anim.save(output_file, writer=writer, dpi=100)
 plt.close()
+
+print(f"✓ Animation saved to {output_file}")
+print("\nMemory-efficient execution complete!")
