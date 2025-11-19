@@ -107,12 +107,18 @@ coords_cond = {
     "lon": infilled_coords["lon"],
 }
 
+# CRITICAL: Free infilled data before loading CBottleVideo to save memory
+del infilled_x, infilled_coords
+torch.cuda.empty_cache()
+gc.collect()
+print("✓ Freed infilled data from GPU memory")
+
 # ============================================================================
 # Step 4: Run CBottleVideo Inference
 # ============================================================================
 print("\nLoading CBottleVideo...")
 package_video = CBottleVideo.load_default_package()
-cbottle_video = CBottleVideo.load_model(package_video, seed=SEED)
+cbottle_video = CBottleVideo.load_model(package_video, seed=SEED, lat_lon=True)
 cbottle_video = cbottle_video.to(device)
 
 print("Running conditional video generation...")
@@ -121,7 +127,7 @@ iterator = cbottle_video.create_iterator(x_cond, coords_cond)
 # CRITICAL: Move x_cond off GPU after starting iterator
 # (Keep a CPU copy if you need it later)
 x_cond_cpu = x_cond.cpu()
-del x_cond, infilled_x, infilled_coords
+del x_cond
 torch.cuda.empty_cache()
 print("✓ Moved input data to CPU")
 
