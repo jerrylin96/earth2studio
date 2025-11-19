@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import os
 import gc
-from datetime import datetime
+from datetime import datetime, timedelta
 import cartopy.crs as ccrs
 
 from earth2studio.data import WB2ERA5
@@ -33,9 +33,52 @@ print(f"Using device: {device}")
 
 # Parameters - CONFIGURE THESE
 VIDEO_VARIABLE = "t850"
-INITIALIZATION_TIME = datetime(2022, 6, 1)
 N_FRAMES = 12  # 0-66 hours in 6-hour steps
 SEED = 42
+INTERPOLATE = True
+
+date_dict = {'year': 2022, 'month': 6, 'day': 1, 'hour': 0, 'minute': 0, 'second': 0}
+
+def generate_datetime_array(year, month, day, hour=0, minute=0, second=0):
+    """
+    Generate a numpy array of 12 datetime objects spaced 6 hours apart.
+    
+    Parameters:
+    -----------
+    year : int
+        Year
+    month : int
+        Month (1-12)
+    day : int
+        Day of month
+    hour : int, optional
+        Hour (0-23), default 0
+    minute : int, optional
+        Minute (0-59), default 0
+    second : int, optional
+        Second (0-59), default 0
+    
+    Returns:
+    --------
+    numpy.ndarray
+        Array of 12 datetime64[ns] objects spaced 6 hours apart
+    """
+    # Create the starting datetime
+    start_time = datetime(year, month, day, hour, minute, second)
+    
+    # Generate 12 timestamps spaced 6 hours apart
+    times = [start_time + timedelta(hours=6*i) for i in range(12)]
+    
+    # Convert to numpy array with datetime64[ns] dtype
+    times_array = np.array(times, dtype="datetime64[ns]")
+    
+    return times_array
+
+# Example usage:
+times = generate_datetime_array(date_dict['year'], date_dict['month'], date_dict['day'])
+print(times)
+print(f"\nShape: {times.shape}")
+print(f"Dtype: {times.dtype}")
 
 # ============================================================================
 # Step 1: Determine Available ERA5 Variables
@@ -52,7 +95,6 @@ print(f"Using {len(available_in_era5)} ERA5 variables for conditioning")
 # ============================================================================
 print("\nFetching ERA5 data...")
 era5_ds = WB2ERA5()
-times = np.array([INITIALIZATION_TIME], dtype="datetime64[ns]")
 
 # Fetch ERA5 data ONCE
 era5_x, era5_coords = fetch_data(era5_ds, times, available_in_era5, device=device)
@@ -92,20 +134,10 @@ else:
 
 print(f"Conditional input shape: {x_cond.shape}")
 
-# Optional: Apply masking (condition only on first/last timesteps)
-# x_cond_masked = x_cond.clone()
-# x_cond_masked[:, 1:-1, :, :, :, :] = float('nan')  # Mask middle timesteps
-# x_cond = x_cond_masked
-
-# Setup coordinates
-coords_cond = {
-    "time": infilled_coords["time"] if "time" in infilled_coords else times,
-    "batch": np.array([0]),
-    "variable": infilled_coords["variable"],
-    "lead_time": infilled_coords.get("lead_time", np.array([np.timedelta64(0, "h")])),
-    "lat": infilled_coords["lat"],
-    "lon": infilled_coords["lon"],
-}
+if INTERPOLATE:
+    x_cond_masked = x_cond.clone()
+    x_cond_masked[:, 1:-1, :, :, :, :] = float('nan')  # Mask middle timesteps
+    x_cond = x_cond_masked
 
 # ============================================================================
 # Step 4: Run CBottleVideo Inference
@@ -114,6 +146,12 @@ print("\nLoading CBottleVideo...")
 package_video = CBottleVideo.load_default_package()
 cbottle_video = CBottleVideo.load_model(package_video, seed=SEED)
 cbottle_video = cbottle_video.to(device)
+
+# Update coordinates for CBottleVideo
+coords_cond = cbottle_video.input_coords()
+coords_cond["time"] = times
+coords_cond["batch"] = np.array([0])
+coords_cond["variable"] = infilled_coords["variable"]
 
 print("Running conditional video generation...")
 iterator = cbottle_video.create_iterator(x_cond, coords_cond)
