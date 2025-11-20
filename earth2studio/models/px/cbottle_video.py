@@ -457,6 +457,265 @@ class CBottleVideo(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         }
         return out
 
+    def get_cbottle_input_multiframe(
+        self,
+        conditions: dict[int, torch.Tensor],
+        times: TimeArray,
+        dataset_modality: DatasetModality = DatasetModality.ERA5,
+        device: torch.device = "cpu",
+    ) -> dict[str, torch.Tensor]:
+        """Creates batch input for cbottle with arbitrary frame conditioning
+
+        Parameters
+        ----------
+        conditions : dict[int, torch.Tensor]
+            Dictionary mapping frame indices (0-11) to HPX conditional tensors of size
+            [time, 45, 4**HPX_LEVEL*12]. If empty dict, no conditioning will be used.
+        times : TimeArray
+            Array of np.datetime64 time stamps to be sampled of size [time], must have
+            SST that can be sampled from self.sst
+        dataset_modality : DatasetModality, optional
+            Dataset modality label, by default DatasetModality.ERA5
+        device : torch.device, optional
+            Torch device, by default "cpu"
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Input batch dictionary used in the CBottle repo
+        """
+        # Known support range for SST
+        for time in times:
+            if time < np.datetime64("1940-01-01") or time >= np.datetime64(
+                "2022-12-12T12:00"
+            ):
+                logger.warning(
+                    f"Request time {time} is outside of the default SST support range"
+                )
+
+        time_steps = [i * self._time_step for i in range(self._time_length)]
+        times = times[:, None] + np.array(time_steps, dtype=np.timedelta64)[None, :]
+
+        time_arr = np.array(times, dtype="datetime64[ns]").reshape(-1)
+        sst_data = torch.from_numpy(
+            self.sst["tosbcs"].interp(time=time_arr, method="linear").values + 273.15
+        ).to(self.device_buffer.device)
+        sst_data = self.sst_regridder(sst_data)
+
+        # TODO: Fix on off device in efficiency here
+        cond = torch.zeros(
+            times.shape[0],
+            47,
+            times.shape[1],
+            4**HPX_LEVEL * 12,
+            dtype=torch.double,
+            device=device,
+        )
+        cond[:, -2, :, :] = torch.tensor(
+            encode_sst(sst_data.cpu()).reshape(times.shape[0], times.shape[1], -1),
+            device=device,
+        )
+        cond[:, self._nan_channels, :, :] = torch.nan
+
+        # Normalize conditions if provided
+        if (
+            len(conditions) > 0
+            and self.core_model.batch_info.center
+            and self.core_model.batch_info.scales
+        ):
+            means = (
+                torch.tensor(self.core_model.batch_info.center)
+                .to(device)
+                .unsqueeze(-1)
+                .unsqueeze(-1)
+            )
+            stds = (
+                torch.tensor(self.core_model.batch_info.scales)
+                .to(device)
+                .unsqueeze(-1)
+                .unsqueeze(-1)
+            )
+
+            # Apply conditioning for each specified frame
+            for frame_idx, condition_tensor in conditions.items():
+                if frame_idx < 0 or frame_idx >= self._time_length:
+                    raise ValueError(
+                        f"Frame index {frame_idx} is out of range [0, {self._time_length-1}]"
+                    )
+                # Normalize and set condition
+                normalized_cond = (condition_tensor.to(device) - means) / stds
+                cond[:, :-2, frame_idx : frame_idx + 1, :] = normalized_cond.to(device)
+                # Set frame mask to 1 for conditioned frames
+                cond[:, -1, frame_idx : frame_idx + 1, :] = 1
+
+        def reorder(x: torch.Tensor) -> torch.Tensor:
+            x = torch.as_tensor(x)
+            x = earth2grid.healpix.reorder(
+                x, earth2grid.healpix.PixelOrder.NEST, earth2grid.healpix.HEALPIX_PAD_XY
+            )
+            return x
+
+        # Set up time tensors
+        times0 = [
+            datetime.fromtimestamp(t.astype("datetime64[s]").astype(int))
+            for t in times.reshape(-1)
+        ]
+        second_of_day = np.array(
+            [(t.hour * 3600) + (t.minute * 60) + t.second for t in times0]
+        ).reshape(times.shape)
+        day_of_year = np.array(
+            [(t - datetime(t.year, 1, 1)).total_seconds() / (86400.0) for t in times0]
+        ).reshape(times.shape)
+        second_of_day = torch.tensor(second_of_day.astype(np.float32), device=device)
+        day_of_year = torch.tensor(day_of_year.astype(np.float32), device=device)
+
+        # Target tensor, not needed for video model since no infill
+        target = torch.empty(1, device=device)
+
+        # Label tensor
+        dataset_modality = DatasetModality(dataset_modality)
+        labels = torch.nn.functional.one_hot(
+            torch.tensor(dataset_modality.value, device=device), num_classes=1024
+        )
+        labels = labels.unsqueeze(0).repeat(len(times), 1)
+
+        out = {
+            "target": target,
+            "labels": labels,
+            "condition": reorder(cond),
+            "second_of_day": second_of_day,
+            "day_of_year": day_of_year,
+        }
+        return out
+
+    def generate_with_conditioning(
+        self,
+        conditions: dict[int, torch.Tensor],
+        time: np.datetime64,
+        coords: CoordSystem | None = None,
+    ) -> tuple[torch.Tensor, CoordSystem]:
+        """Generate 12 frames with arbitrary frame conditioning
+
+        This method allows you to condition the video generation on any subset of the
+        12 frames. Unlike create_iterator which is designed for autoregressive rollout,
+        this method generates a single 12-frame sequence with flexible conditioning.
+
+        Parameters
+        ----------
+        conditions : dict[int, torch.Tensor]
+            Dictionary mapping frame indices (0-11) to conditional tensors. Each tensor
+            should have shape matching the input_coords spatial dimensions:
+            - If lat_lon=True: [batch, 1, variables, 721, 1440]
+            - If lat_lon=False: [batch, 1, variables, 49152]
+            Empty dict for fully unconditional generation.
+        time : np.datetime64
+            Initial timestamp for frame 0. Subsequent frames will be at 6-hour intervals.
+        coords : CoordSystem, optional
+            Coordinate system. If None, will be constructed from input_coords() and time.
+
+        Returns
+        -------
+        tuple[torch.Tensor, CoordSystem]
+            Generated 12-frame tensor and output coordinate system:
+            - If lat_lon=True: [batch, 12, variables, 721, 1440]
+            - If lat_lon=False: [batch, 12, variables, 49152]
+
+        Example
+        -------
+        .. highlight:: python
+        .. code-block:: python
+
+            import numpy as np
+            import torch
+            from datetime import datetime
+
+            from earth2studio.models.px import CBottleVideo
+
+            # Load model
+            package = CBottleVideo.load_default_package()
+            model = CBottleVideo.load_model(package)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = model.to(device)
+
+            # Prepare conditioning for frames 0 and 6
+            # Frame 0: fully specified
+            frame_0 = torch.randn(1, 1, 45, 721, 1440, device=device)
+            # Frame 6: partially specified (will be converted to HEALPix internally)
+            frame_6 = torch.randn(1, 1, 45, 721, 1440, device=device)
+
+            conditions = {0: frame_0, 6: frame_6}
+            time = np.datetime64("2022-01-01T00:00")
+
+            # Generate 12 frames conditioned on frames 0 and 6
+            output, output_coords = model.generate_with_conditioning(conditions, time)
+            print(f"Output shape: {output.shape}")  # [1, 12, 45, 721, 1440]
+            print(f"Lead times: {output_coords['lead_time']}")  # [0h, 6h, ..., 66h]
+        """
+        device = self.device_buffer.device
+
+        # Build coordinate system if not provided
+        if coords is None:
+            coords = self.input_coords()
+            coords["time"] = np.array([time])
+            coords["batch"] = np.array([0])
+
+        # Validate frame indices
+        for frame_idx in conditions.keys():
+            if frame_idx < 0 or frame_idx >= self._time_length:
+                raise ValueError(
+                    f"Frame index {frame_idx} must be in range [0, {self._time_length-1}]"
+                )
+
+        # Convert lat/lon conditions to HEALPix if needed
+        hpx_conditions = {}
+        for frame_idx, cond_tensor in conditions.items():
+            if self.lat_lon:
+                # Condition is in lat/lon, convert to HEALPix
+                # Expected shape: [batch, 1, variables, 721, 1440]
+                hpx_cond = self.condition_regridder(cond_tensor.double())
+            else:
+                hpx_cond = cond_tensor
+
+            # Reshape to [batch, variables, 1, hpx]
+            batch_size = hpx_cond.shape[0]
+            n_vars = hpx_cond.shape[2]
+            hpx_cond = hpx_cond.reshape(batch_size, n_vars, 1, -1)
+            hpx_conditions[frame_idx] = hpx_cond
+
+        # Set up model parameters
+        self.core_model.sigma_min = self.sigma_min
+        self.core_model.sigma_max = self.sigma_max
+        self.core_model.num_steps = self.sampler_steps
+        self.core_model.time_stepper = TimeStepperFunction(self.time_stepper).value
+
+        # Create input batch
+        times = coords["time"].repeat(coords["batch"].shape[0])
+        input_batch = self.get_cbottle_input_multiframe(
+            hpx_conditions, times, dataset_modality=self.dataset_modality, device=device
+        )
+
+        # Sample from model
+        out, _ = self.core_model.sample(input_batch, seed=self.seed)
+
+        # Regrid back to lat/lon if needed
+        if self.lat_lon:
+            out = self.output_regridder(out.contiguous().double())
+
+        # [batch, vars, lead, ...] -> [batch, lead, vars, ...]
+        out = out.transpose(1, 2)
+
+        # Build output coordinates
+        output_coords = coords.copy()
+        lead_times = np.array(
+            [i * self._time_step for i in range(self._time_length)], dtype="timedelta64[ns]"
+        )
+        output_coords["lead_time"] = lead_times
+        # Add batch dimension back if needed
+        if "batch" not in output_coords:
+            output_coords["batch"] = np.array([0])
+
+        return out.float(), output_coords
+
     @classmethod
     def load_default_package(cls) -> Package:
         """Default pre-trained CBottle3D model package from Nvidia model registry"""
