@@ -1,4 +1,5 @@
 import argparse
+import logging
 import calendar
 import gc
 import os
@@ -14,6 +15,8 @@ from earth2studio.data import WB2ERA5
 from earth2studio.lexicon import WB2Lexicon, CBottleLexicon
 from earth2studio.data.utils import fetch_data
 from earth2studio.models.dx import CBottleInfill
+
+logging.getLogger('earth2studio').setLevel(logging.WARNING)
 
 def setup_args():
     parser = argparse.ArgumentParser()
