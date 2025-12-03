@@ -20,13 +20,20 @@
 #$ -tc 10                     # Max 10 GPUs running at once
 # ---------------------------------------------------------------------
 
-# 1. Environment Setup (Matched to your working script)
+# Ensure logs directory exists
+mkdir -p logs
+
+# 1. Environment Setup
 module load miniconda/25.3.1
 module load gcc/12.2.0
 module load cuda/12.8
 
-# Activate your specific environment
+# Activate conda environment with error checking
 conda activate cbottle_env_experimental
+if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to activate conda environment cbottle_env_experimental"
+    exit 1
+fi
 
 # Prevent Numpy/Pytorch from spawning too many threads
 export OMP_NUM_THREADS=1
@@ -37,7 +44,7 @@ export NUMEXPR_NUM_THREADS=1
 # Use the job-specific local scratch space
 export EARTH2STUDIO_CACHE="/scratch/$USER/e2_cache_$JOB_ID_$SGE_TASK_ID"
 # Explicitly set Modulus cache too, as earth2studio uses it under the hood
-export MODULUS_CACHE="$EARTH2STUDIO_CACHE" 
+export MODULUS_CACHE="$EARTH2STUDIO_CACHE"
 
 mkdir -p "$EARTH2STUDIO_CACHE"
 
@@ -48,13 +55,25 @@ echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 echo "Cache: $EARTH2STUDIO_CACHE"
 echo "=========================================================="
 
-# 3. Run
-# We map the Task ID directly to the Year argument
+# 3. Run Python Script
+# Map the Task ID directly to the Year argument
+# Output: All years in same directory for easier management
 python3 fetch_infill_year.py \
     --year $SGE_TASK_ID \
-    --output_dir "/projectnb/eb-general/shared_data/data/processed/era5_infilled/$SGE_TASK_ID"
+    --output_dir "/projectnb/eb-general/shared_data/data/processed/era5_infilled"
+
+# Capture exit code
+EXITCODE=$?
 
 # 4. Cleanup
 echo "Cleaning up local cache..."
 rm -rf "$EARTH2STUDIO_CACHE"
+
+# Check if job succeeded
+if [ $EXITCODE -ne 0 ]; then
+    echo "ERROR: fetch_infill_year.py failed with exit code $EXITCODE"
+    exit $EXITCODE
+fi
+
 echo "Done."
+exit 0
