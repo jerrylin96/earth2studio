@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from datetime import datetime, timedelta
+import logging
 from loguru import logger
 
 # Earth2Studio imports
@@ -44,7 +45,8 @@ def diagnose_nans(data, var_names):
     # Iterate over variables (Dimension 1)
     for i, var_name in enumerate(var_names):
         # Slice: All times, specific variable, all lat/lon
-        var_slice = data[:, i, :, :]
+        # Dimensions: time, lead_time (size 1), var, lat, lon
+        var_slice = data[:, 0, i, :, :]
         nan_count = torch.isnan(var_slice).sum().item()
         
         if nan_count > 0:
@@ -52,7 +54,8 @@ def diagnose_nans(data, var_names):
             
             # Find which time steps are affected
             # Collapse lat/lon (dim 1, 2 of the slice) to see if time step has any nan
-            affected_times = torch.where(torch.isnan(var_slice).amax(dim=(1, 2)))[0]
+            affected_times = torch.where(torch.isnan(var_slice).any(dim=(1, 2)))[0]
+
             
             # Print the first few affected time indices as a hint
             limit = 5
@@ -67,6 +70,7 @@ def main(args):
     # 1. Silence Logs
     logger.remove()
     logger.add(sys.stderr, level="WARNING")
+    logging.getLogger('earth2studio').setLevel(logging.WARNING)
 
     year = args.year
     output_path = Path(args.output_dir)
