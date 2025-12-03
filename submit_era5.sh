@@ -10,7 +10,7 @@
 #$ -l h_rt=24:00:00           # 24 Hour Hard Limit
 #$ -l gpus=1                  # Request 1 GPU
 #$ -l gpu_c=8.0               # Capability >= 8.0 (Ensures A100/H100/H200 class)
-#$ -l gpu_type=H200|A100|A40  # Request high-memory GPUs (H200 is first pref)
+#$ -l gpu_type=H200|A100      # Request high-memory GPUs (H200 is first pref)
 #$ -pe omp 4                  # 4 CPU Cores
 #$ -l mem_per_core=8G         # 32GB Total RAM
 
