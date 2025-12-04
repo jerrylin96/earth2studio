@@ -29,7 +29,7 @@ def create_datetime_array(year, month):
     start_time = datetime(year=year, month=month, day=1)
     return np.array([start_time + timedelta(hours=6*i) for i in range(num_days * 4)], dtype="datetime64[ns]")
 
-def diagnose_nans(data, var_names):
+def log_nans(data, var_names):
     """
     Scans the tensor for NaNs and prints a detailed report of which variables/times are affected.
     Assumes data shape is (Time, Variable, Lat, Lon).
@@ -37,9 +37,6 @@ def diagnose_nans(data, var_names):
     if not torch.isnan(data).any():
         return # Clean data
     
-    print("\n" + "!"*50)
-    print(f"CRITICAL FAILURE: NaNs detected in input data!")
-    print("!"*50)
     print(f"Diagnostic Report:")
     
     # Iterate over variables (Dimension 1)
@@ -51,20 +48,6 @@ def diagnose_nans(data, var_names):
         
         if nan_count > 0:
             print(f"  - Variable '{var_name}' (Index {i}): {nan_count} NaNs found.")
-            
-            # Find which time steps are affected
-            # Collapse lat/lon (dim 1, 2 of the slice) to see if time step has any nan
-            affected_times = torch.where(torch.isnan(var_slice).any(dim=(1, 2)))[0]
-
-            
-            # Print the first few affected time indices as a hint
-            limit = 5
-            time_list = affected_times.tolist()
-            shown = time_list[:limit]
-            print(f"    -> Affected Time Steps (Indices): {shown}{'...' if len(time_list)>limit else ''}")
-            
-    print("!"*50 + "\n")
-    raise ValueError("Input data contains NaNs (see report above).")
 
 def main(args):
     # 1. Silence Logs
@@ -147,7 +130,7 @@ def main(args):
             # Check for NaNs before we even touch the GPU
             # We assume 'coords' has a key 'variable' which is the list of names
             var_names = coords.get('variable', input_variables)
-            diagnose_nans(data, var_names)
+            log_nans(data, var_names)
             # -----------------------
 
             with torch.inference_mode():
@@ -162,13 +145,9 @@ def main(args):
             gc.collect()
             print(f"Infilled and saved {year}-{month:02d}:")
         except Exception as e:
-            # We catch the ValueError from diagnose_nans here and exit cleanly
             print(f"Error during Infilling/Saving {year}-{month:02d}:")
             # If it's our specific NaN error, print the message, otherwise traceback
-            if "Input data contains NaNs" in str(e):
-                print(str(e))
-            else:
-                traceback.print_exc()
+            traceback.print_exc()
             exit(1)
 
     print(f"--- Year {year} Completed Successfully ---")
