@@ -32,7 +32,7 @@ def create_datetime_array(year, month):
 def log_nans(data, var_names):
     """
     Scans the tensor for NaNs and prints a detailed report of which variables/times are affected.
-    Assumes data shape is (Time, Variable, Lat, Lon).
+    Assumes data shape is [time, lead_time, var, lat, lon].
     """
     if not torch.isnan(data).any():
         return # Clean data
@@ -140,10 +140,10 @@ def main(args):
             print(f"Saving to {filename}...")
             torch.save({'data': infilled_data, 'coords': infilled_coords}, save_path)
             
-            del data, infilled_data
+            del data, infilled_data, coords, infilled_coords
             torch.cuda.empty_cache()
             gc.collect()
-            print(f"Infilled and saved {year}-{month:02d}:")
+            print(f"✓ Infilled and saved {year}-{month:02d}")
         except Exception as e:
             print(f"Error during Infilling/Saving {year}-{month:02d}:")
             # If it's our specific NaN error, print the message, otherwise traceback
